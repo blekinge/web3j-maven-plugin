@@ -1,22 +1,34 @@
 package org.web3j.mavenplugin.solidity;
 
+import org.apache.commons.exec.CommandLine;
+import org.apache.commons.exec.DefaultExecutor;
+import org.apache.commons.exec.Executor;
+import org.apache.commons.exec.PumpStreamHandler;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.tuple.Triple;
 import org.apache.maven.plugin.logging.Log;
 
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
  * Compiles the given Solidity Contracts into binary code.
- *
+ * <p>
  * Inspired by https://github.com/ethereum/ethereumj/tree/develop/ethereumj-core/src/main/java/org/ethereum/solidity
  */
 public class SolidityCompiler {
@@ -27,11 +39,17 @@ public class SolidityCompiler {
 
     private static SolidityCompiler INSTANCE;
 
+    private Triple<Integer, Integer, Integer> version;
+
     private SolidityCompiler(Log log) {
         this.LOG = log;
-        if (!solidityCompilerExists()) {
+        Triple<Integer, Integer, Integer> local_version = solidityVersion();
+        if (local_version == null) {
             LOG.info("Solidity Compiler from library is used");
             solc = new SolC();
+            version = solidityVersion();
+        } else {
+            version = local_version;
         }
     }
 
@@ -44,90 +62,119 @@ public class SolidityCompiler {
 
     public CompilerResult compileSrc(
             byte[] source, SolidityCompiler.Options... options) {
+        return compileSrc(source, null, null, options);
+    }
+
+    public CompilerResult compileSrc(
+            byte[] source, Path basePath, Path[] allowedImportPaths, SolidityCompiler.Options... options) {
 
 
         boolean success = false;
-        String error;
-        String output;
-        Process process;
+        String error = "";
+        String output = "";
 
-        try {
-            process = (solc != null)
-                    ? getSolCProcessFromLibrary(options)
-                    : getSolCProcessFromSystem(options);
+        Map<String, String> environment = new HashMap<>();
+        String canonicalSolCPath;
+        if (solc == null) {
+            canonicalSolCPath = "solc";
+        } else {
+            canonicalSolCPath = solc.getCanonicalPath();
+            environment.put("LD_LIBRARY_PATH", solc.getCanonicalWorkingDirectory());
+        }
 
-            try (BufferedOutputStream stream = new BufferedOutputStream(process.getOutputStream())) {
-                stream.write(source);
-            }
-            ParallelReader errorReader = new ParallelReader(process.getErrorStream());
-            ParallelReader outputReader = new ParallelReader(process.getInputStream());
-            errorReader.start();
-            outputReader.start();
+        List<String> commandParts = prepareCommandOptions(canonicalSolCPath, basePath, allowedImportPaths, options);
 
-            success = process.waitFor() == 0;
-            error = errorReader.getContent();
-            output = outputReader.getContent();
+        CommandLine commandLine = CommandLine.parse(commandParts.stream().reduce((a, b) -> a + " " + b).get());
+        LOG.debug(commandLine.toString());
 
-        } catch (IOException | InterruptedException e) {
+        File executionDir = allowedImportPaths != null ? basePath.toAbsolutePath().toFile() : null;
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        try (InputStream stdin = new ByteArrayInputStream(source);){
+
+            Executor exec = new DefaultExecutor();
+            exec.setWorkingDirectory(executionDir);
+            exec.setStreamHandler(new PumpStreamHandler(stdout, stderr, stdin));
+
+            success = exec.execute(commandLine, environment) == 0;
+
+        } catch (IOException e) {
             StringWriter errorWriter = new StringWriter();
             e.printStackTrace(new PrintWriter(errorWriter));
             error = errorWriter.toString();
-            output = "";
+        } finally {
+            IOUtils.closeQuietly(stdout);
+            IOUtils.closeQuietly(stderr);
+            output += stdout.toString();
+            error += stderr.toString();
         }
 
         return new CompilerResult(error, output, success);
     }
 
-    private Process getSolCProcessFromLibrary(Options[] options) throws IOException {
-        assert solc != null;
-
-        Process process;
-        String canonicalSolCPath = solc.getCanonicalPath();
-        List<String> commandParts = prepareCommandOptions(canonicalSolCPath, options);
-        ProcessBuilder processBuilder = new ProcessBuilder(commandParts)
-                .directory(solc.getWorkingDirectory());
-        processBuilder
-                .environment()
-                .put("LD_LIBRARY_PATH", solc.getCanonicalWorkingDirectory());
-        process = processBuilder.start();
-        return process;
-    }
-
-    private Process getSolCProcessFromSystem(Options[] options) throws IOException {
-        Process process;
-        List<String> commandParts = prepareCommandOptions("solc", options);
-        process = Runtime.getRuntime().exec(commandParts.toArray(new String[commandParts.size()]));
-        return process;
-    }
-
-    private List<String> prepareCommandOptions(String canonicalSolCPath, SolidityCompiler.Options... options) {
+    private List<String> prepareCommandOptions(String canonicalSolCPath, Path basePath, Path[] allowedImportPaths, SolidityCompiler.Options... options) {
         List<String> commandParts = new ArrayList<>();
         commandParts.add(canonicalSolCPath);
+
+        //Allow-paths was added in 0.4.11, which is not in our native bundled version
+        if (version.compareTo(Triple.of(0, 4, 11)) > 0) {
+            if (allowedImportPaths != null) {
+                for (Path allowedImportPath : allowedImportPaths) {
+                    commandParts.add("--allow-paths=" + allowedImportPath.toAbsolutePath().toString() + "/");
+                }
+            }
+        }
+
+        if (basePath == null) {
+            commandParts.add(" =./");
+        }
+
         commandParts.add("--optimize");
+        commandParts.add("--overwrite");
         commandParts.add("--combined-json");
+
         commandParts.add(Arrays.stream(options).map(option -> option.toString()).collect(Collectors.joining(",")));
+
+        //This was nessesary to read from stdIn when we added the basepath mappings above...
+        commandParts.add("-");
         return commandParts;
     }
 
-    private boolean solidityCompilerExists() {
+    public Triple<Integer, Integer, Integer> solidityVersion() {
         try {
-            Process p = Runtime.getRuntime().exec("solc --version");
-
-            String output;
-            try (java.util.Scanner s = new java.util.Scanner(p.getInputStream())) {
-                output = s.useDelimiter("\\A").hasNext() ? s.next() : "";
-            }
-            if (p.waitFor() == 0) {
-                LOG.info("Solidity Compiler found");
-                LOG.debug(output);
-                return true;
+            String solcPath;
+            if (solc != null) {
+                solcPath = solc.getCanonicalPath();
             } else {
-                LOG.error(output);
+                solcPath = "solc";
             }
-        } catch (InterruptedException | IOException e) {
+            CommandLine commandLine = CommandLine.parse(solcPath + " --version");
+            DefaultExecutor exec = new DefaultExecutor();
+
+            ByteArrayOutputStream stdoutAndErr = new ByteArrayOutputStream();
+            exec.setStreamHandler(new PumpStreamHandler(stdoutAndErr));
+
+            boolean success = exec.execute(commandLine) == 0;
+
+            if (success) {
+                String output = stdoutAndErr.toString();
+                LOG.info("Solidity Compiler found in "+ Paths.get(solcPath).toAbsolutePath().toString());
+
+                Pattern pattern = Pattern.compile(".*((\\d+)\\.(\\d+)\\.(\\d+)).*");
+                for (String line : output.split("\n")) {
+                    Matcher matcher = pattern.matcher(line);
+                    if (matcher.matches()) {
+                        return Triple.of(Integer.parseInt(matcher.group(2)), Integer.parseInt(matcher.group(3)), Integer.parseInt(matcher.group(4)));
+                    }
+                }
+            }
+        } catch (IOException ignored) {
             LOG.info("Solidity Compiler not installed.");
+
         }
-        return false;
+        return null;
     }
 
     public enum Options {
@@ -153,48 +200,4 @@ public class SolidityCompiler {
     }
 
 
-    private static class ParallelReader extends Thread {
-
-        private InputStream stream;
-        private String content;
-
-        //private StringBuilder content = new StringBuilder();
-
-        ParallelReader(InputStream stream) {
-            this.stream = stream;
-        }
-
-        public String getContent() throws InterruptedException {
-            return getContent(true);
-        }
-
-        public synchronized String getContent(boolean waitForComplete) {
-            if (waitForComplete) {
-                while (stream != null) {
-                    try {
-                        wait();
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        // we are being interrupted so we should stop running
-                        return null;
-                    }
-                }
-            }
-            return content;
-        }
-
-        public void run() {
-
-            try (BufferedReader buffer = new BufferedReader(new InputStreamReader(stream))) {
-                content = buffer.lines().collect(Collectors.joining(System.lineSeparator()));
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            } finally {
-                synchronized (this) {
-                    stream = null;
-                    notifyAll();
-                }
-            }
-        }
-    }
 }

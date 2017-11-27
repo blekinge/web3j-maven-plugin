@@ -20,4 +20,13 @@ public class CompilerResult {
     public boolean isFailed() {
         return !success;
     }
+
+    @Override
+    public String toString() {
+        return "CompilerResult{" +
+                "errors='" + errors + '\'' +
+                ", output='" + output + '\'' +
+                ", success=" + success +
+                '}';
+    }
 }

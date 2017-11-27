@@ -11,10 +11,12 @@ import org.apache.maven.shared.model.fileset.util.FileSetManager;
 import org.web3j.codegen.SolidityFunctionWrapper;
 import org.web3j.mavenplugin.solidity.CompilerResult;
 import org.web3j.mavenplugin.solidity.SolidityCompiler;
+import org.web3j.utils.Strings;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.Map;
@@ -44,6 +46,12 @@ public class JavaClassGeneratorMojo extends AbstractMojo {
     @Parameter(property = "soliditySourceFiles")
     protected FileSet soliditySourceFiles = new FileSet();
 
+    @Parameter(property = "solidityImportPaths")
+    protected FileSet solidityImportPaths = new FileSet();
+
+    @Parameter(property = "solidityBasePath", defaultValue = DEFAULT_SOLIDITY_SOURCES)
+    protected String solidityBasePath;
+
     @Parameter(property = "contract")
     protected Contract contract;
 
@@ -59,6 +67,16 @@ public class JavaClassGeneratorMojo extends AbstractMojo {
         if (soliditySourceFiles.getIncludes().size() == 0) {
             getLog().info("No solidity contracts specified, using the default [" + DEFAULT_INCLUDE + "]");
             soliditySourceFiles.setIncludes(Collections.singletonList(DEFAULT_INCLUDE));
+        }
+
+        if (solidityImportPaths.getDirectory() == null){
+            getLog().info("No solidity import specified, using default directory [" + soliditySourceFiles.getDirectory() + "]");
+            solidityImportPaths.setDirectory(soliditySourceFiles.getDirectory());
+        }
+
+        if (solidityBasePath == null){
+            getLog().info("No solidity base path specified, using solidity sourcedirectory [" + soliditySourceFiles.getDirectory() + "]");
+            solidityBasePath = soliditySourceFiles.getDirectory();
         }
 
         for (String includedFile : new FileSetManager().getIncludedFiles(soliditySourceFiles)) {
@@ -84,8 +102,8 @@ public class JavaClassGeneratorMojo extends AbstractMojo {
                 continue;
             }
             try {
-                generatedJavaClass(contracts, contractName);
-                getLog().info("\tBuilt Class for contract '" + contractName + "'");
+                Path javaFile = generatedJavaClass(contracts, contractName);
+                getLog().info("\tBuilt Class "+javaFile.toString()+" for contract '" + contractName + "'");
             } catch (ClassNotFoundException | IOException ioException) {
                 getLog().error("Could not build java class for contract '" + contractName + "'", ioException);
             }
@@ -109,6 +127,8 @@ public class JavaClassGeneratorMojo extends AbstractMojo {
             byte[] contract = Files.readAllBytes(Paths.get(soliditySourceFiles.getDirectory(), includedFile));
             CompilerResult result = SolidityCompiler.getInstance(getLog()).compileSrc(
                     contract,
+                    Paths.get(solidityBasePath),
+                    new Path[]{Paths.get(solidityImportPaths.getDirectory())},
                     SolidityCompiler.Options.ABI,
                     SolidityCompiler.Options.BIN,
                     SolidityCompiler.Options.INTERFACE,
@@ -126,13 +146,18 @@ public class JavaClassGeneratorMojo extends AbstractMojo {
         }
     }
 
-    private void generatedJavaClass(Map<String, Map<String, String>> result, String contractName) throws IOException, ClassNotFoundException {
+    private Path generatedJavaClass(Map<String, Map<String, String>> result, String contractName) throws IOException, ClassNotFoundException {
+        String localName = contractName.replaceFirst("^.*:", "");
         new SolidityFunctionWrapper(nativeJavaType).generateJavaFiles(
-                contractName,
+                localName,
                 result.get(contractName).get(SolidityCompiler.Options.BIN.getName()),
                 result.get(contractName).get(SolidityCompiler.Options.ABI.getName()),
                 sourceDestination,
                 packageName);
+
+        String packagedir = packageName.replaceAll("\\.", File.separator);
+        String filename = Strings.capitaliseFirstLetter(localName) + ".java";
+        return Paths.get(sourceDestination, packagedir, filename);
     }
 
     private boolean isFiltered(String contractName) {
